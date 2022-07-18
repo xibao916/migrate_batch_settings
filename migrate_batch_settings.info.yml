@@ -1,0 +1,9 @@
+name: 'Migrate batch settings'
+description: 'Provides migration batch settings'
+package: Custom
+
+type: module
+core_version_requirement: ^9
+
+dependencies:
+  - migrate_tools

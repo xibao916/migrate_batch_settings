@@ -1,0 +1,140 @@
+<?php
+
+/**
+ * @file
+ * For migrate batch settings.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\migrate\MigrateMessage;
+use Drupal\migrate_batch_settings\MigrateBatchExecutable;
+use Drupal\migrate\Plugin\MigrationInterface;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function migrate_batch_settings_form_migration_execute_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Add a batch size setting.
+  $form['options']['batch_size'] = [
+    '#type' => 'number',
+    '#title' => t('Batch size to:'),
+    '#size' => 10,
+    '#description' => t('Set the size of each batch execution.'),
+  ];
+  // Custom submit handler.
+  $form['#submit'][0] = '_migrate_batch_settings_migration_execute_form_submit';
+}
+
+/**
+ * Implement custom form submit function.
+ */
+function _migrate_batch_settings_migration_execute_form_submit(array &$form, FormStateInterface $form_state) {
+  $migration_plugin_manager = \Drupal::service('plugin.manager.migration');
+  $route_match = \Drupal::service('current_route_match');
+  $operation = $form_state->getValue('operation');
+
+  if ($form_state->getValue('batch_size')) {
+    $batch_size = $form_state->getValue('batch_size');
+  }
+  else {
+    $batch_size = 0;
+  }
+  if ($form_state->getValue('limit')) {
+    $limit = $form_state->getValue('limit');
+  }
+  else {
+    $limit = 0;
+  }
+
+  if ($form_state->getValue('update')) {
+    $update = $form_state->getValue('update');
+  }
+  else {
+    $update = 0;
+  }
+  if ($form_state->getValue('force')) {
+    $force = $form_state->getValue('force');
+  }
+  else {
+    $force = 0;
+  }
+
+  $migration = $route_match->getParameter('migration');
+  if ($migration) {
+    $migration_id = $migration->id();
+    /** @var \Drupal\migrate\Plugin\MigrationInterface $migration_plugin */
+    $migration_plugin = $migration_plugin_manager->createInstance($migration_id, $migration->toArray());
+    $migrateMessage = new MigrateMessage();
+
+    switch ($operation) {
+      case 'import':
+
+        $options = [
+          'limit' => $limit,
+          'update' => $update,
+          'force' => $force,
+          'batch_size' => $batch_size,
+        ];
+
+        $executable = new MigrateBatchExecutable($migration_plugin, $migrateMessage, $options);
+        $executable->batchImport();
+
+        break;
+
+      case 'rollback':
+
+        $options = [
+          'limit' => $limit,
+          'update' => $update,
+          'force' => $force,
+        ];
+
+        $executable = new MigrateBatchExecutable($migration_plugin, $migrateMessage, $options);
+        $status = $executable->rollback();
+        if ($status === MigrationInterface::RESULT_COMPLETED) {
+          \Drupal::messenger()->addStatus(t('Rollback completed', ['@id' => $migration_id]));
+        }
+        else {
+          \Drupal::messenger()->addError(t('Rollback of !name migration failed.', ['!name' => $migration_id]));
+        }
+        break;
+
+      case 'stop':
+
+        $migration_plugin->interruptMigration(MigrationInterface::RESULT_STOPPED);
+        $status = $migration_plugin->getStatus();
+        switch ($status) {
+          case MigrationInterface::STATUS_IDLE:
+            \Drupal::messenger()->addStatus(t('Migration @id is idle', ['@id' => $migration_id]));
+            break;
+
+          case MigrationInterface::STATUS_DISABLED:
+            \Drupal::messenger()->addWarning(t('Migration @id is disabled', ['@id' => $migration_id]));
+            break;
+
+          case MigrationInterface::STATUS_STOPPING:
+            \Drupal::messenger()->addWarning(t('Migration @id is already stopping', ['@id' => $migration_id]));
+            break;
+
+          default:
+            $migration->interruptMigration(MigrationInterface::RESULT_STOPPED);
+            \Drupal::messenger()->addStatus(t('Migration @id requested to stop', ['@id' => $migration_id]));
+            break;
+        }
+        break;
+
+      case 'reset':
+        $status = $migration_plugin->getStatus();
+        if ($status === MigrationInterface::STATUS_IDLE) {
+          \Drupal::messenger()->addWarning(t('Migration @id is already Idle', ['@id' => $migration_id]));
+        }
+        else {
+          \Drupal::messenger()->addStatus(t('Migration @id reset to Idle', ['@id' => $migration_id]));
+        }
+        $migration_plugin->setStatus(MigrationInterface::STATUS_IDLE);
+
+        break;
+
+    }
+  }
+}
