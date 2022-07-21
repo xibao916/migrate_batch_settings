@@ -24,6 +24,13 @@ class CSV extends SourceCSV {
   protected $baseDirectory = 'private://migration_batch/';
 
   /**
+   * Whether this instance should cache the source count.
+   *
+   * @var bool
+   */
+  protected $cacheCounts = TRUE;
+
+  /**
    * The spl object.
    *
    * @var \SplFileObject
@@ -144,6 +151,18 @@ class CSV extends SourceCSV {
     }
 
     return $this->splFileObject;
+  }
+
+  /**
+   * Gets the source count.
+   *
+   * @return int
+   *   source total line.
+   */
+  protected function doCount() {
+    $spl_object = $this->getSplFileObject();
+    $spl_object->seek(PHP_INT_MAX);
+    return $spl_object->key() - 1;
   }
 
 }
