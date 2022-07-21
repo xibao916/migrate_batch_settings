@@ -10,6 +10,8 @@ use Drupal\migrate\MigrateMessage;
 use Drupal\migrate_batch_settings\MigrateBatchExecutable;
 use Drupal\migrate\Plugin\MigrationInterface;
 
+const BATCH_BASEDIR = 'private://migration_batch/';
+
 /**
  * Implements hook_form_FORM_ID_alter().
  */
@@ -34,7 +36,7 @@ function _migrate_batch_settings_migration_execute_form_submit(array &$form, For
   $operation = $form_state->getValue('operation');
 
   if ($form_state->getValue('batch_size')) {
-    $batch_size = $form_state->getValue('batch_size');
+    $batch_size = (int) $form_state->getValue('batch_size');
   }
   else {
     $batch_size = 0;
@@ -65,6 +67,12 @@ function _migrate_batch_settings_migration_execute_form_submit(array &$form, For
     /** @var \Drupal\migrate\Plugin\MigrationInterface $migration_plugin */
     $migration_plugin = $migration_plugin_manager->createInstance($migration_id, $migration->toArray());
     $migrateMessage = new MigrateMessage();
+
+    // Clear old files data.
+    \Drupal::service('file_system')->deleteRecursive(BATCH_BASEDIR . $migration_id . '/');
+    $session = \Drupal::request()->getSession();
+    $files_key = 'migrate_' . $migration_id . '_files';
+    $session->remove($files_key);
 
     switch ($operation) {
       case 'import':

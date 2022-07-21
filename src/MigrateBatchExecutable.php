@@ -6,6 +6,14 @@ use Drupal\migrate\MigrateMessage;
 use Drupal\migrate\MigrateMessageInterface;
 use Drupal\migrate\Plugin\MigrationInterface;
 use Drupal\migrate_tools\MigrateBatchExecutable as Migrate_toolsMigrateBatchExecutable;
+use Drupal\migrate\Event\MigrateEvents;
+use Drupal\migrate\Event\MigrateImportEvent;
+use Drupal\migrate\Event\MigratePostRowSaveEvent;
+use Drupal\migrate\Event\MigratePreRowSaveEvent;
+use Drupal\migrate\Exception\RequirementsException;
+use Drupal\migrate\MigrateException;
+use Drupal\migrate\MigrateSkipRowException;
+use Drupal\migrate\Plugin\MigrateIdMapInterface;
 
 /**
  * Defines a migrate executable class for batch migrations through UI.
@@ -18,6 +26,13 @@ class MigrateBatchExecutable extends Migrate_toolsMigrateBatchExecutable {
    * @var array
    */
   protected $batchSize = 0;
+
+  /**
+   * The handle source.
+   *
+   * @var \Drupal\migrate\Plugin\MigrateSourceInterface
+   */
+  protected $handleSource;
 
   /**
    * {@inheritdoc}
@@ -125,6 +140,7 @@ class MigrateBatchExecutable extends Migrate_toolsMigrateBatchExecutable {
       $context['sandbox']['total'] = 0;
       $context['sandbox']['counter'] = 0;
       $context['sandbox']['batch_limit'] = 0;
+      $context['sandbox']['batch_id'] = 0;
       $context['sandbox']['operation'] = MigrateBatchExecutable::BATCH_IMPORT;
     }
 
@@ -159,9 +175,20 @@ class MigrateBatchExecutable extends Migrate_toolsMigrateBatchExecutable {
 
     // Make sure we know our batch context.
     $executable->setBatchContext($context);
-
+    $session = \Drupal::request()->getSession();
+    $key = 'migrate_' . $migration_id;
+    $session->set($key, [
+      'batch_size' => $options['batch_size'],
+      'batch_id' => $context['sandbox']['batch_id'],
+    ]);
     // Do the import.
     $result = $executable->import();
+    // Clear tmp file.
+    $file_key = $key . '_files';
+    $current_file_path = $session->get($file_key)[$context['sandbox']['batch_id']];
+    \Drupal::service('file_system')->deleteRecursive($current_file_path);
+    $session->remove($key);
+    $context['sandbox']['batch_id']++;
 
     // Store the result; will need to combine the results of all our iterations.
     $context['results'][$migration->id()] = [
@@ -177,7 +204,20 @@ class MigrateBatchExecutable extends Migrate_toolsMigrateBatchExecutable {
     if (
       $result != MigrationInterface::RESULT_INCOMPLETE
     ) {
-      $context['finished'] = 1;
+      if ($options['batch_size'] > 0 && $context['sandbox']['batch_id'] == 1) {
+        $context['finished'] = ((float) $context['sandbox']['counter'] / (float) $context['sandbox']['total']);
+        $context['message'] = t('Importing %migration (@percent%) Imported: @counter.', [
+          '%migration' => $migration->label(),
+          '@percent' => sprintf('%.2f', ($context['finished'] * 100)),
+          '@counter' => $context['sandbox']['counter'],
+        ]);
+      }
+      else {
+        $context['finished'] = 1;
+        // Clear old files data.
+        \Drupal::service('file_system')->deleteRecursive(BATCH_BASEDIR . $migration_id . '/');
+        $session->remove($file_key);
+      }
     }
     else {
       $context['sandbox']['counter'] = $context['results'][$migration->id()]['@numitems'];
@@ -190,7 +230,187 @@ class MigrateBatchExecutable extends Migrate_toolsMigrateBatchExecutable {
         ]);
       }
     }
+  }
 
+  /**
+   * Returns the handle source.
+   *
+   * Makes sure source is initialized based on migration settings.
+   *
+   * @return \Drupal\migrate\Plugin\MigrateSourceInterface
+   *   The source.
+   */
+  protected function getHandleSource() {
+    $this->handleSource = \Drupal::service('plugin.manager.migrate.source')->createInstance('csv_batch', $this->migration->getSourceConfiguration(), $this->migration);
+    return $this->handleSource;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function import() {
+    // Only begin the import operation if the migration is currently idle.
+    if ($this->migration->getStatus() !== MigrationInterface::STATUS_IDLE) {
+      $this->message->display($this->t('Migration @id is busy with another operation: @status',
+        [
+          '@id' => $this->migration->id(),
+          '@status' => $this->t($this->migration->getStatusLabel()),
+        ]), 'error');
+      return MigrationInterface::RESULT_FAILED;
+    }
+    $this->getEventDispatcher()->dispatch(new MigrateImportEvent($this->migration, $this->message), MigrateEvents::PRE_IMPORT);
+
+    // Knock off migration if the requirements haven't been met.
+    try {
+      $this->migration->checkRequirements();
+    }
+    catch (RequirementsException $e) {
+      $this->message->display(
+        $this->t(
+          'Migration @id did not meet the requirements. @message @requirements',
+          [
+            '@id' => $this->migration->id(),
+            '@message' => $e->getMessage(),
+            '@requirements' => $e->getRequirementsString(),
+          ]
+        ),
+        'error'
+      );
+
+      return MigrationInterface::RESULT_FAILED;
+    }
+
+    $this->migration->setStatus(MigrationInterface::STATUS_IMPORTING);
+    $source = $this->getHandleSource();
+
+    try {
+      $source->rewind();
+    }
+    catch (\Exception $e) {
+      $this->message->display(
+        $this->t('Migration failed with source plugin exception: @e in @file line @line', [
+          '@e' => $e->getMessage(),
+          '@file' => $e->getFile(),
+          '@line' => $e->getLine(),
+        ]), 'error');
+      $this->migration->setStatus(MigrationInterface::STATUS_IDLE);
+      return MigrationInterface::RESULT_FAILED;
+    }
+
+    // Get the process pipeline.
+    $pipeline = FALSE;
+    if ($source->valid()) {
+      try {
+        $pipeline = $this->migration->getProcessPlugins();
+      }
+      catch (MigrateException $e) {
+        $row = $source->current();
+        $this->sourceIdValues = $row->getSourceIdValues();
+        $this->getIdMap()->saveIdMapping($row, [], $e->getStatus());
+        $this->saveMessage($e->getMessage(), $e->getLevel());
+      }
+    }
+
+    $return = MigrationInterface::RESULT_COMPLETED;
+    if ($pipeline) {
+      $id_map = $this->getIdMap();
+      $destination = $this->migration->getDestinationPlugin();
+      while ($source->valid()) {
+        $row = $source->current();
+        $this->sourceIdValues = $row->getSourceIdValues();
+
+        try {
+          foreach ($pipeline as $destination_property_name => $plugins) {
+            $this->processPipeline($row, $destination_property_name, $plugins, NULL);
+          }
+          $save = TRUE;
+        }
+        catch (MigrateException $e) {
+          $this->getIdMap()->saveIdMapping($row, [], $e->getStatus());
+          $msg = sprintf("%s:%s: %s", $this->migration->getPluginId(), $destination_property_name, $e->getMessage());
+          $this->saveMessage($msg, $e->getLevel());
+          $save = FALSE;
+        }
+        catch (MigrateSkipRowException $e) {
+          if ($e->getSaveToMap()) {
+            $id_map->saveIdMapping($row, [], MigrateIdMapInterface::STATUS_IGNORED);
+          }
+          if ($message = trim($e->getMessage())) {
+            $msg = sprintf("%s:%s: %s", $this->migration->getPluginId(), $destination_property_name, $message);
+            $this->saveMessage($msg, MigrationInterface::MESSAGE_INFORMATIONAL);
+          }
+          $save = FALSE;
+        }
+
+        if ($save) {
+          try {
+            $this->getEventDispatcher()
+              ->dispatch(new MigratePreRowSaveEvent($this->migration, $this->message, $row), MigrateEvents::PRE_ROW_SAVE);
+            $destination_ids = $id_map->lookupDestinationIds($this->sourceIdValues);
+            $destination_id_values = $destination_ids ? reset($destination_ids) : [];
+            $destination_id_values = $destination->import($row, $destination_id_values);
+            $this->getEventDispatcher()
+              ->dispatch(new MigratePostRowSaveEvent($this->migration, $this->message, $row, $destination_id_values), MigrateEvents::POST_ROW_SAVE);
+            if ($destination_id_values) {
+              // We do not save an idMap entry for config.
+              if ($destination_id_values !== TRUE) {
+                $id_map->saveIdMapping($row, $destination_id_values, $this->sourceRowStatus, $destination->rollbackAction());
+              }
+            }
+            else {
+              $id_map->saveIdMapping($row, [], MigrateIdMapInterface::STATUS_FAILED);
+              if (!$id_map->messageCount()) {
+                $message = $this->t('New object was not saved, no error provided');
+                $this->saveMessage($message);
+                $this->message->display($message);
+              }
+            }
+          }
+          catch (MigrateException $e) {
+            $this->getIdMap()->saveIdMapping($row, [], $e->getStatus());
+            $this->saveMessage($e->getMessage(), $e->getLevel());
+          }
+          catch (\Exception $e) {
+            $this->getIdMap()
+              ->saveIdMapping($row, [], MigrateIdMapInterface::STATUS_FAILED);
+            $this->handleException($e);
+          }
+        }
+
+        $this->sourceRowStatus = MigrateIdMapInterface::STATUS_IMPORTED;
+
+        // Check for memory exhaustion.
+        if (($return = $this->checkStatus()) != MigrationInterface::RESULT_COMPLETED) {
+          break;
+        }
+
+        // If anyone has requested we stop, return the requested result.
+        if ($this->migration->getStatus() == MigrationInterface::STATUS_STOPPING) {
+          file_put_contents('while_end.txt', $return . '-- stop');
+          $return = $this->migration->getInterruptionResult();
+          $this->migration->clearInterruptionResult();
+          break;
+        }
+
+        try {
+          $source->next();
+        }
+        catch (\Exception $e) {
+          $this->message->display(
+            $this->t('Migration failed with source plugin exception: @e in @file line @line', [
+              '@e' => $e->getMessage(),
+              '@file' => $e->getFile(),
+              '@line' => $e->getLine(),
+            ]), 'error');
+          $this->migration->setStatus(MigrationInterface::STATUS_IDLE);
+          return MigrationInterface::RESULT_FAILED;
+        }
+      }
+    }
+
+    $this->getEventDispatcher()->dispatch(new MigrateImportEvent($this->migration, $this->message), MigrateEvents::POST_IMPORT);
+    $this->migration->setStatus(MigrationInterface::STATUS_IDLE);
+    return $return;
   }
 
   /**
